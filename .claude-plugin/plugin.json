@@ -1,0 +1,1 @@
+{ "name": "goodhart", "version": "0.1.0", "description": "Track (key, value, goal) metrics in a Claude Code session, and see which change moved which metric", "license": "MIT", "types": "./types/index.d.ts" }
