@@ -1,17 +1,21 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Direction, Metric, View } from '../types'
+import type { Direction, Insight, Metric, View } from '../types'
 
 const PANE = 'goodhart'
 const TITLE = 'Goodhart'
 const TOOL = 'mcp__goodhart__metric'
+const INSIGHT_TOOL = 'mcp__goodhart__insight'
 const metrics = atom({ plugin: 'goodhart', key: 'metrics' } as const, [], {
   shape: 'metrics-1',
 })
 // Docked panes default to a big share of the screen; ask for a narrow one (the person can still drag it).
 const OPEN = { id: PANE, title: TITLE, columns: 52, backgroundColor: '#000000' }
 const view = atom({ plugin: 'goodhart', key: 'view' } as const, 'pane' as View)
+const insights = atom({ plugin: 'goodhart', key: 'insights' } as const, [] as Insight[])
+// The metric whose history the pane shows unfolded ('' = none).
+const expanded = atom({ plugin: 'goodhart', key: 'expanded' } as const, '')
 const objective = atom({ plugin: 'goodhart', key: 'objective' } as const, '')
 
 
@@ -141,6 +145,36 @@ const summary = (list: Metric[], rows: ChangeRow[]) =>
     })
     .join('\n')
 
+/** Findings the tracker raises by itself when a record moves a goal or exposes a trade-off. */
+const autoInsights = (before: Metric[], after: Metric[], key: string, change: string | undefined): Insight[] => {
+  const was = before.find(m => m.key === key)
+  const now = after.find(m => m.key === key)
+  if (!now) return []
+  const at = Date.now()
+  const n = now.history.length
+  const by = change ? ` after "${change}"` : ''
+  const out: Insight[] = []
+  const metBefore = was ? isMet(was) : false
+  if (!metBefore && isMet(now)) {
+    out.push({ id: `met:${key}:${n}`, kind: 'met', at, text: `${key} reached its goal (${goalText(now).replace('goal ', '')})${by}.` })
+  }
+  if (metBefore && !isMet(now)) {
+    out.push({ id: `lost:${key}:${n}`, kind: 'lost', at, text: `${key} slipped back past its goal (${fmt(last(now)?.value, now.unit)})${by}.` })
+  }
+  const row = change ? changeRows(after).find(r => r.label === change) : undefined
+  if (row) {
+    const up = row.effects.filter(ef => ef.isBetter === true).map(ef => ef.key)
+    const down = row.effects.filter(ef => ef.isBetter === false).map(ef => ef.key)
+    if (up.length && down.length) {
+      out.push({ id: `tradeoff:${change}:${down.join(',')}`, kind: 'tradeoff', at, text: `Trade-off: "${change}" improved ${up.join(', ')} but hurt ${down.join(', ')}.` })
+    }
+  }
+  return out
+}
+
+/** Add insights whose id is new; a dismissed id stays dismissed. */
+const addInsights = (list: Insight[], fresh: Insight[]) => [...list, ...fresh.filter(f => !list.some(i => i.id === f.id))]
+
 const parseDirection = (s: unknown): Direction | undefined =>
   s === 'up' || s === 'down' ? s : undefined
 
@@ -189,6 +223,21 @@ export const register: Register = on => {
         required: ['action', 'key'],
       },
     })
+    await $.tool.register({
+      name: 'insight',
+      isDeferred: false,
+      description: [
+        'Show the user a short insight in a band above the prompt, until they dismiss it.',
+        'Post one when you notice something non-obvious about the tracked metrics or the work toward them:',
+        'a change that drove most of a gain, a trade-off, a result inside the noise, a goal that looks wrong, a next lever worth trying.',
+        'One sentence, concrete numbers, no restating what the metric pane already shows. Post rarely: at most one per finding.',
+      ].join(' '),
+      inputSchema: {
+        type: 'object',
+        properties: { text: { type: 'string', description: 'One sentence, under 120 characters.' } },
+        required: ['text'],
+      },
+    })
     if ((await read($, view)) === 'pane') void $.ui.open(OPEN)
 
     return next(e)
@@ -212,7 +261,8 @@ export const register: Register = on => {
     }
 
     let message = ''
-    await update($, metrics, list => {
+    const before = await read($, metrics)
+    const after = await update($, metrics, list => {
       const now = Date.now()
       const prev = list.find(m => m.key === key)
       const m: Metric = prev
@@ -248,7 +298,21 @@ export const register: Register = on => {
       return prev ? list.map(x => (x.key === key ? m : x)) : [...list, m]
     })
 
+    const fresh = autoInsights(before, after, key, typeof input.change === 'string' ? input.change : undefined)
+    if (fresh.length) {
+      await update($, insights, l => addInsights(l, fresh))
+      $.ui.toast(fresh[fresh.length - 1]!.text)
+    }
+
     return { result: message }
+  })
+
+  on('tool.call', { tool: new RegExp(`^${INSIGHT_TOOL}$`) }, async ($, e) => {
+    const text = String((e as unknown as Record<string, unknown>).text ?? '').trim()
+    if (!text) return { result: 'Error: text is required.', isError: true }
+    const at = Date.now()
+    await update($, insights, l => addInsights(l, [{ id: `claude:${at}`, kind: 'claude', at, text }]))
+    return { result: 'Shown above the prompt until the user dismisses it.' }
   })
 
   on('command.run', { command: 'goodhart' }, async ($, e) => {
@@ -317,10 +381,12 @@ export const register: Register = on => {
     const list = await read($, metrics)
     if (list.length === 0) return next(e)
     const goal = await read($, objective)
+    const shown = (await read($, insights)).filter(i => !i.isDismissed)
     const block = [
       'Goodhart metrics for this session (record new values with mcp__goodhart__metric after each measurement, with a change label; optimize toward agreed goals; a proposed goal still needs the user to agree):',
       ...(goal ? [`Objective: ${goal}`] : []),
       summary(list, changeRows(list)),
+      ...(shown.length ? ['Insights already shown to the user (do not repeat):', ...shown.map(i => `- ${i.text}`)] : []),
     ].join('\n')
     return next({ ...e, context: [...(e.context ?? []), block] })
   })
@@ -368,13 +434,40 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, metrics)
-    if (e.props.hasSurvey || list.length === 0 || (await read($, view)) !== 'band') return next(e)
-    const { Box, Text } = $.ui.resolve(e)
-    const keyWidth = Math.max(...list.map(m => m.key.length))
+    const active = (await read($, insights)).filter(i => !i.isDismissed)
+    const showMetrics = list.length > 0 && (await read($, view)) === 'band'
+    if (e.props.hasSurvey || (!showMetrics && active.length === 0)) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const keyWidth = Math.max(0, ...list.map(m => m.key.length))
+    const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
+    const TAG = { claude: ' INSIGHT ', met: ' GOAL MET ', lost: ' SLIPPED ', tradeoff: ' TRADEOFF ' } as const
+    const TAG_BG = { claude: BB.amber, met: BB.green, lost: BB.red, tradeoff: BB.amber } as const
+    const dismiss = (ids: string[]) =>
+      void update($, insights, l => l.map(i => (ids.includes(i.id) ? { ...i, isDismissed: true } : i)))
+    const shownInsights = active.slice(-3)
 
     return (
       <Box flexDirection="column">
-        {list.map(m => {
+        {shownInsights.map(i => (
+          <Box>
+            <Text backgroundColor={TAG_BG[i.kind]} color={BB.black} bold>
+              {TAG[i.kind]}
+            </Text>
+            <Text color={BB.white}> {fit(i.text, Math.max(10, cols - TAG[i.kind].length - 14))} </Text>
+            <Button key={`dismiss:${i.id}`} plain dimColor onPress={() => dismiss([i.id])}>
+              ✕ dismiss
+            </Button>
+          </Box>
+        ))}
+        {active.length > 1 ? (
+          <Box>
+            <Text color={BB.grey}>{active.length > 3 ? ` +${active.length - 3} older  ` : ' '}</Text>
+            <Button key="dismiss-all" plain dimColor onPress={() => dismiss(active.map(i => i.id))}>
+              ✕ dismiss all
+            </Button>
+          </Box>
+        ) : null}
+        {(showMetrics ? list : []).map(m => {
           const now = last(m)
           const prev = m.history[m.history.length - 2]
           const delta = now && prev ? now.value - prev.value : undefined
@@ -411,9 +504,10 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const list = await read($, metrics)
     const goal = await read($, objective)
+    const open = await read($, expanded)
     const W = Math.max(40, e.props.bodyColumns ?? e.viewport?.columns ?? 48)
     const clock = new Date(Date.now()).toTimeString().slice(0, 5)
 
@@ -472,12 +566,19 @@ export const register: Register = on => {
           const p = progress(m)
           const met = isMet(m)
           const best = bestChange(rows, m.key)
+          const isOpen = open === m.key
           return (
             <Box flexDirection="column">
-              <Text>
-                <Text color={met ? BB.green : BB.amber} bold>
-                  {fit(` ${met ? '✓' : ' '}${m.key.toUpperCase()}`, tickerW)}
-                </Text>
+              <Box>
+                <Button
+                  key={`m:${m.key}`}
+                  plain
+                  onPress={() => void update($, expanded, k => (k === m.key ? '' : m.key))}
+                >
+                  <Text color={met ? BB.green : BB.amber} bold>
+                    {fit(`${isOpen ? '▾' : '▸'}${met ? '✓' : ' '}${m.key.toUpperCase()}`, tickerW)}
+                  </Text>
+                </Button>
                 <Text color={BB.white} bold>
                   {fmtNum(now?.value).padStart(C.last)}
                 </Text>
@@ -491,19 +592,46 @@ export const register: Register = on => {
                   {'  '}
                   {sparkline(m, C.trend - 2)}
                 </Text>
-              </Text>
-              <Text color={BB.grey}>
-                {fit(
-                  `   TGT ${m.target === undefined ? '--' : `${m.direction === 'up' ? '≥' : '≤'}${fmtNum(m.target)}${m.unit ? ` ${m.unit}` : ''}`}` +
-                    ` ${m.goalStatus === 'agreed' ? 'AGREED' : m.goalStatus === 'proposed' ? 'PROPOSED' : ''}` +
-                    (best ? `  BEST ${best.label.toUpperCase()}` : ''),
-                  W,
-                )}
-              </Text>
+              </Box>
+              <Box>
+                <Text color={BB.grey}>
+                  {`   TGT ${m.target === undefined ? '--' : `${m.direction === 'up' ? '≥' : '≤'}${fmtNum(m.target)}${m.unit ? ` ${m.unit}` : ''}`}`}
+                  {m.goalStatus === 'agreed' ? ' AGREED' : ''}
+                </Text>
+                {m.goalStatus === 'proposed' ? (
+                  <Button
+                    key={`agree:${m.key}`}
+                    plain
+                    onPress={() =>
+                      void update($, metrics, l => l.map(x => (x.key === m.key ? { ...x, goalStatus: 'agreed' as const } : x)))
+                    }
+                  >
+                    <Text backgroundColor={BB.amber} color={BB.black} bold>
+                      {' AGREE '}
+                    </Text>
+                  </Button>
+                ) : null}
+                <Text color={BB.grey}>{best ? fit(`  BEST ${best.label.toUpperCase()}`, Math.max(0, W - 30)) : ''}</Text>
+              </Box>
+              {isOpen
+                ? [...m.history].reverse().map((pt, i, arr) => {
+                    const older = arr[i + 1]
+                    const d = older ? pt.value - older.value : undefined
+                    const good = d === undefined || d === 0 ? undefined : (d > 0) === (m.direction === 'up')
+                    return (
+                      <Text>
+                        <Text color={BB.white}>{`     ${fmtNum(pt.value)}`.padEnd(13)}</Text>
+                        <Text color={good === undefined ? BB.grey : good ? BB.green : BB.red}>
+                          {(d === undefined || d === 0 ? '' : `${d > 0 ? '▲' : '▼'}${fmtNum(Math.abs(d))}`).padEnd(9)}
+                        </Text>
+                        <Text color={BB.amberDim}>{fit((pt.change ?? '').toUpperCase(), Math.max(0, W - 22))}</Text>
+                      </Text>
+                    )
+                  })
+                : null}
             </Box>
           )
         })}
-
         <Text> </Text>
         <Bar left="2) CHANGES" right={`${rows.length} TOTAL`} bg={BB.blue} fg={BB.white} />
         {rows.length === 0 ? <Text color={BB.grey}> NO LABELLED CHANGES YET</Text> : null}
@@ -542,13 +670,40 @@ export const register: Register = on => {
         {rows.length > changeFit ? <Text color={BB.grey}> +{rows.length - changeFit} OLDER</Text> : null}
 
         <Text> </Text>
-        <Text>
-          <Text backgroundColor={BB.amber} color={BB.black} bold> view band </Text>
-          <Text color={BB.amberDim}> BAND  </Text>
-          <Text backgroundColor={BB.amber} color={BB.black} bold> agree all </Text>
-          <Text color={BB.amberDim}> ACCEPT  </Text>
-          <Text backgroundColor={BB.amber} color={BB.black} bold> help </Text>
-        </Text>
+        <Box>
+          {list.some(m => m.goalStatus === 'proposed') ? (
+            <Button
+              key="agree-all"
+              hotkey="a"
+              onPress={() =>
+                void update($, metrics, l =>
+                  l.map(x => (x.goalStatus === 'proposed' ? { ...x, goalStatus: 'agreed' as const } : x)),
+                )
+              }
+            >
+              agree all
+            </Button>
+          ) : null}
+          <Text> </Text>
+          <Button
+            key="expand-all"
+            hotkey="e"
+            onPress={() => void update($, expanded, k => (k ? '' : (list[0]?.key ?? '')))}
+          >
+            {open ? 'collapse' : 'expand'}
+          </Button>
+          <Text> </Text>
+          <Button
+            key="to-band"
+            hotkey="b"
+            onPress={() => {
+              void update($, view, () => 'band' as View)
+              void $.ui.close({ id: PANE })
+            }}
+          >
+            band view
+          </Button>
+        </Box>
       </Box>
     )
   })

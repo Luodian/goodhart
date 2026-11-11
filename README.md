@@ -34,6 +34,10 @@ Ask Claude to propose metrics for the task at hand. Claude records values with t
 | `/goodhart agree <key\|all>` | Accept the goals Claude proposed |
 | `/goodhart rm <key>` / `/goodhart clear` | Remove one metric / everything |
 
+In the pane, click a metric's name to unfold its history, click AGREE beside a proposed goal to accept it, or use the footer buttons (hotkeys `a` agree all, `e` expand, `b` band view once the pane has focus).
+
+Insights show in a band above the prompt until you dismiss them. Claude posts its own findings with the `insight` tool, and the tracker raises some by itself on each record: a metric that reached its goal, one that slipped back past it, and a change that improved one metric while hurting another. A dismissed insight is not raised again.
+
 Each record call also draws a small card in the transcript with the value at that moment, its step and the goal. The side panel docks beside the transcript in the fullscreen terminal layout from 110 columns; on the main screen it opens above the prompt.
 
 ## License

@@ -26,8 +26,19 @@ export type Metric = {
   goalStatus: 'none' | 'proposed' | 'agreed'
 }
 
+/** A finding shown above the prompt until the user dismisses it. */
+export type Insight = {
+  /** Stable id; an automatic insight's id encodes its cause, so a dismissed one is not raised again. */
+  id: string
+  text: string
+  /** claude = posted by Claude; met / lost / tradeoff = raised by the tracker on a record. */
+  kind: 'claude' | 'met' | 'lost' | 'tradeoff'
+  at: number
+  isDismissed?: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'goodhart': { metrics: Shaped<Metric[]>; view: View; objective: string }
+    'goodhart': { metrics: Shaped<Metric[]>; view: View; objective: string; expanded: string; insights: Insight[] }
   }
 }
