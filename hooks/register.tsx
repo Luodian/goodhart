@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type { Direction, Insight, Metric, View } from '../types'
 
@@ -12,7 +12,9 @@ const metrics = atom({ plugin: 'goodhart', key: 'metrics' } as const, [], {
 })
 // Docked panes default to a big share of the screen; ask for a narrow one (the person can still drag it).
 const OPEN = { id: PANE, title: TITLE, columns: 52, backgroundColor: '#000000' }
-const view = atom({ plugin: 'goodhart', key: 'view' } as const, 'pane' as View)
+// auto = band until the user agrees a goal, then the pane. A new key, so sessions that stored the old
+// 'pane' default also start in auto.
+const view = atom({ plugin: 'goodhart', key: 'mode' } as const, 'auto' as View)
 const insights = atom({ plugin: 'goodhart', key: 'insights' } as const, [] as Insight[])
 // The metric whose history the pane shows unfolded ('' = none).
 const expanded = atom({ plugin: 'goodhart', key: 'expanded' } as const, '')
@@ -175,18 +177,36 @@ const autoInsights = (before: Metric[], after: Metric[], key: string, change: st
 /** Add insights whose id is new; a dismissed id stays dismissed. */
 const addInsights = (list: Insight[], fresh: Insight[]) => [...list, ...fresh.filter(f => !list.some(i => i.id === f.id))]
 
+/** What auto resolves to: the pane once any goal is agreed, the band before that. */
+const effectiveView = (v: View, list: Metric[]): 'band' | 'pane' =>
+  v !== 'auto' ? v : list.some(m => m.goalStatus === 'agreed') ? 'pane' : 'band'
+
 const parseDirection = (s: unknown): Direction | undefined =>
   s === 'up' || s === 'down' ? s : undefined
 
 const HELP = [
   '/goodhart                      show the metrics (band or pane)',
-  '/goodhart view band|pane       band = lines above the prompt, pane = side panel',
+  '/goodhart view auto|band|pane  auto (default) = band until a goal is agreed, then pane',
   '/goodhart objective <text>     set what this session is optimizing for',
   '/goodhart set <key> <target> [up|down]   set or change a goal (marks it agreed)',
   '/goodhart agree <key|all>      accept the goal Claude proposed',
   '/goodhart rm <key>             remove a metric',
   '/goodhart clear                remove all metrics and the objective',
 ].join('\n')
+
+/** Open or close the pane to match the view; called after anything that changes agreed goals. */
+async function syncView($: EngineInterface) {
+  const v = effectiveView(await read($, view), await read($, metrics))
+  if (v === 'pane') await $.ui.open(OPEN)
+  else await $.ui.close({ id: PANE })
+}
+
+async function agree($: EngineInterface, keys: string[]) {
+  await update($, metrics, l =>
+    l.map(m => (keys.includes(m.key) && m.target !== undefined ? { ...m, goalStatus: 'agreed' as const } : m)),
+  )
+  await syncView($)
+}
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -238,7 +258,7 @@ export const register: Register = on => {
         required: ['text'],
       },
     })
-    if ((await read($, view)) === 'pane') void $.ui.open(OPEN)
+    if (effectiveView(await read($, view), await read($, metrics)) === 'pane') void $.ui.open(OPEN)
 
     return next(e)
   })
@@ -319,15 +339,14 @@ export const register: Register = on => {
     const raw = e.args.trim()
     const [sub, key, a, b] = raw.split(/\s+/).filter(Boolean)
     if (!sub) {
-      if ((await read($, view)) === 'pane') await $.ui.open(OPEN)
+      await syncView($)
       return { text: 'Goodhart shown. /goodhart help lists the commands.' }
     }
     if (sub === 'help') return { text: HELP }
     if (sub === 'view') {
-      if (key !== 'band' && key !== 'pane') return { text: 'Usage: /goodhart view band|pane' }
+      if (key !== 'auto' && key !== 'band' && key !== 'pane') return { text: 'Usage: /goodhart view auto|band|pane' }
       await update($, view, () => key)
-      if (key === 'pane') await $.ui.open(OPEN)
-      else await $.ui.close({ id: PANE })
+      await syncView($)
       return { text: `Goodhart view: ${key}.` }
     }
     if (sub === 'objective') {
@@ -338,22 +357,22 @@ export const register: Register = on => {
     if (sub === 'clear') {
       await update($, metrics, () => [])
       await update($, objective, () => '')
+      await syncView($)
       return { text: 'All metrics and the objective removed.' }
     }
 
     const list = await read($, metrics)
     const hit = list.find(m => m.key === key)
     if (sub === 'agree') {
-      const keys = key === 'all' ? list.filter(m => m.goalStatus === 'proposed').map(m => m.key) : hit ? [key] : []
+      const keys = key === 'all' ? list.filter(m => m.goalStatus === 'proposed').map(m => m.key) : hit ? [hit.key] : []
       if (keys.length === 0) return { text: `Nothing to agree for "${key ?? ''}".` }
-      await update($, metrics, l =>
-        l.map(m => (keys.includes(m.key) && m.target !== undefined ? { ...m, goalStatus: 'agreed' as const } : m)),
-      )
+      await agree($, keys)
       return { text: `Agreed goals: ${keys.join(', ')}.` }
     }
     if (sub === 'rm') {
       if (!hit) return { text: `No metric "${key ?? ''}".` }
       await update($, metrics, l => l.filter(m => m.key !== key))
+      await syncView($)
       return { text: `Removed ${key}.` }
     }
     if (sub === 'set') {
@@ -370,6 +389,7 @@ export const register: Register = on => {
         }
         return prev ? l.map(x => (x.key === key ? m : x)) : [...l, m]
       })
+      await syncView($)
       return { text: `Goal for ${key}: ${direction === 'down' ? '<=' : '>='} ${target} (agreed).` }
     }
     return { text: HELP }
@@ -435,7 +455,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const list = await read($, metrics)
     const active = (await read($, insights)).filter(i => !i.isDismissed)
-    const showMetrics = list.length > 0 && (await read($, view)) === 'band'
+    const showMetrics = list.length > 0 && effectiveView(await read($, view), list) === 'band'
+    const proposed = list.filter(m => m.goalStatus === 'proposed').map(m => m.key)
     if (e.props.hasSurvey || (!showMetrics && active.length === 0)) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     const keyWidth = Math.max(0, ...list.map(m => m.key.length))
@@ -475,6 +496,7 @@ export const register: Register = on => {
           const p = progress(m)
           const met = isMet(m)
           return (
+            <Box key={`band:${m.key}`}>
             <Text>
               <Text bold color={met ? 'green' : undefined}>
                 {met ? '✓ ' : '  '}
@@ -497,8 +519,28 @@ export const register: Register = on => {
                 {sparkline(m, 12)}
               </Text>
             </Text>
+            {m.goalStatus === 'proposed' ? (
+              <Button key={`band-agree:${m.key}`} plain onPress={() => void agree($, [m.key])}>
+                <Text backgroundColor={BB.amber} color={BB.black} bold>
+                  {' AGREE '}
+                </Text>
+              </Button>
+            ) : null}
+            </Box>
           )
         })}
+        {showMetrics && proposed.length > 1 ? (
+          <Box>
+            <Button key="band-agree-all" plain onPress={() => void agree($, proposed)}>
+              <Text backgroundColor={BB.amber} color={BB.black} bold>
+                {' AGREE ALL '}
+              </Text>
+            </Button>
+            <Text dimColor>  agreeing a goal opens the full pane</Text>
+          </Box>
+        ) : showMetrics && proposed.length === 1 ? (
+          <Text dimColor>  agreeing a goal opens the full pane</Text>
+        ) : null}
       </Box>
     )
   })
@@ -602,9 +644,7 @@ export const register: Register = on => {
                   <Button
                     key={`agree:${m.key}`}
                     plain
-                    onPress={() =>
-                      void update($, metrics, l => l.map(x => (x.key === m.key ? { ...x, goalStatus: 'agreed' as const } : x)))
-                    }
+                    onPress={() => void agree($, [m.key])}
                   >
                     <Text backgroundColor={BB.amber} color={BB.black} bold>
                       {' AGREE '}
@@ -675,11 +715,7 @@ export const register: Register = on => {
             <Button
               key="agree-all"
               hotkey="a"
-              onPress={() =>
-                void update($, metrics, l =>
-                  l.map(x => (x.goalStatus === 'proposed' ? { ...x, goalStatus: 'agreed' as const } : x)),
-                )
-              }
+              onPress={() => void agree($, list.filter(x => x.goalStatus === 'proposed').map(x => x.key))}
             >
               agree all
             </Button>

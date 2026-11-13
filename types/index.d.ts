@@ -1,7 +1,7 @@
 export type Direction = 'up' | 'down'
 
-/** band = compact lines above the prompt; pane = side panel. */
-export type View = 'band' | 'pane'
+/** band = compact lines above the prompt; pane = side panel; auto = band until a goal is agreed, then pane. */
+export type View = 'auto' | 'band' | 'pane'
 
 export type Point = {
   value: number
@@ -39,6 +39,6 @@ export type Insight = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'goodhart': { metrics: Shaped<Metric[]>; view: View; objective: string; expanded: string; insights: Insight[] }
+    'goodhart': { metrics: Shaped<Metric[]>; mode: View; objective: string; expanded: string; insights: Insight[] }
   }
 }

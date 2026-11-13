@@ -27,6 +27,7 @@ Ask Claude to propose metrics for the task at hand. Claude records values with t
 | Command | What it does |
 |---|---|
 | `/goodhart` | Show the metrics |
+| `/goodhart view auto` | Default: metrics show as a band above the prompt while goals are only proposed, and the side panel opens once you agree a goal |
 | `/goodhart view pane` | Side panel in a terminal-style layout: metrics table, change log, trade-offs |
 | `/goodhart view band` | One line per metric above the prompt |
 | `/goodhart objective <text>` | Set what the session is optimizing for |
@@ -34,7 +35,7 @@ Ask Claude to propose metrics for the task at hand. Claude records values with t
 | `/goodhart agree <key\|all>` | Accept the goals Claude proposed |
 | `/goodhart rm <key>` / `/goodhart clear` | Remove one metric / everything |
 
-In the pane, click a metric's name to unfold its history, click AGREE beside a proposed goal to accept it, or use the footer buttons (hotkeys `a` agree all, `e` expand, `b` band view once the pane has focus).
+In the band, click AGREE beside a proposed goal (or AGREE ALL) to accept it; the first agreed goal switches to the pane. In the pane, click a metric's name to unfold its history, click AGREE beside a proposed goal to accept it, or use the footer buttons (hotkeys `a` agree all, `e` expand, `b` band view once the pane has focus).
 
 Insights show in a band above the prompt until you dismiss them. Claude posts its own findings with the `insight` tool, and the tracker raises some by itself on each record: a metric that reached its goal, one that slipped back past it, and a change that improved one metric while hurting another. A dismissed insight is not raised again.
 
